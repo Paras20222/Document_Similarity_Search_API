@@ -22,7 +22,7 @@ A machine learning powered API that finds similar documents using embeddings and
 
 1. Clone the repository:
    ```
-   git clone https://github.com/yourusername/document-similarity-search.git
+   git clone https://github.com/Paras20222/Document_Similarity_Search_API
    cd document-similarity-search
    ```
 
