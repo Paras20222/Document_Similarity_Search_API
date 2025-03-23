@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Document Similarity Search</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <h1>Document Similarity Search</h1>
+        
+        <div class="search-container">
+            <div class="search-box">
+                <input type="text" id="query" placeholder="Enter search query">
+                <select id="metric">
+                    <option value="cosine">Cosine Similarity</option>
+                    <option value="dot">Dot Product</option>
+                    <option value="euclidean">Euclidean Distance</option>
+                </select>
+                <button id="searchButton">Search</button>
+            </div>
+            
+            <div class="add-doc-box">
+                <input type="text" id="docTitle" placeholder="Document title">
+                <textarea id="docContent" placeholder="Document content"></textarea>
+                <button id="addDocButton">Add Document</button>
+            </div>
+        </div>
+        
+        <div id="results"></div>
+    </div>
+
+    <script src="/static/script.js"></script>
+</body>
+</html>
