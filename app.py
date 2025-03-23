@@ -158,6 +158,8 @@ async def rebuild_index():
     index.add_with_ids(embeddings, doc_ids)
     logger.info(f"FAISS index rebuilt with {len(doc_ids)} documents")
 
+import numpy as np
+
 def compute_similarity(query_embedding, doc_embeddings, metric):
     """Computes similarity scores."""
     if metric == "cosine":
@@ -174,10 +176,31 @@ def compute_similarity(query_embedding, doc_embeddings, metric):
         doc_embeddings /= norms
         
         return np.dot(doc_embeddings, query_embedding)
+    
     elif metric == "dot":
+        # Normalize vectors for comparable scores
+        query_norm = np.linalg.norm(query_embedding)
+        if query_norm == 0:
+            query_embedding = np.ones_like(query_embedding) / np.sqrt(len(query_embedding))
+        else:
+            query_embedding /= query_norm
+            
+        norms = np.linalg.norm(doc_embeddings, axis=1, keepdims=True)
+        norms[norms == 0] = 1  # Avoid division by zero
+        doc_embeddings /= norms
+        
         return np.dot(doc_embeddings, query_embedding)
+    
     elif metric == "euclidean":
-        return np.abs(-np.linalg.norm(doc_embeddings - query_embedding, axis=1))
+        # Calculate Euclidean distance and convert to similarity score
+        distances = np.linalg.norm(doc_embeddings - query_embedding, axis=1)
+        # Invert distance to get similarity score (higher is more similar)
+        max_distance = np.max(distances)
+        if max_distance == 0:
+            return np.ones_like(distances)
+        else:
+            return 1 - (distances / max_distance)
+    
     raise ValueError(f"Unsupported metric: {metric}")
 
 @app.get("/", tags=["Root"])
