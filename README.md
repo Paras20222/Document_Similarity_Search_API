@@ -44,7 +44,7 @@ A machine learning powered API that finds similar documents using embeddings and
 
 ## Loading Sample Data
 
-The repository includes a script to load sample BBC news articles:
+The repository includes a script to load sample AG news dataset:
 
 ```
 python load_data.py
