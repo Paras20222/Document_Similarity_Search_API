@@ -2,8 +2,8 @@
   "version": 2,
   "builds": [
     {
-      "src": "app.py",  // Make sure the main entry point file is correct
-      "use": "@vercel/python",  // This tells Vercel to use the Python runtime
+      "src": "app.py",  
+      "use": "@vercel/python", 
       "config": {
         "installCommand": "pip install --upgrade pip && pip install -r requirements.txt"
       }
