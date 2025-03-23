@@ -5,13 +5,18 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Document Similarity Search</title>
     <link rel="stylesheet" href="/static/style.css">
+    <link rel="icon" type="image/x-icon" href="static/_favicon.ico">
 </head>
 <body>
     <div class="container">
-        <h1>Document Similarity Search</h1>
+        <header>
+            <h1>Document Similarity Search</h1>
+            <p>Find similar documents with ease!</p>
+        </header>
         
         <div class="search-container">
             <div class="search-box">
+                <h2>Search for Documents</h2>
                 <input type="text" id="query" placeholder="Enter search query">
                 <select id="metric">
                     <option value="cosine">Cosine Similarity</option>
@@ -22,13 +27,19 @@
             </div>
             
             <div class="add-doc-box">
+                <h2>Add New Document</h2>
                 <input type="text" id="docTitle" placeholder="Document title">
                 <textarea id="docContent" placeholder="Document content"></textarea>
                 <button id="addDocButton">Add Document</button>
             </div>
         </div>
         
-        <div id="results"></div>
+        <div id="results">
+            <h2>Search Results</h2>
+            <div id="result-list"></div>
+        </div>
+        
+        <div id="messages"></div>
     </div>
 
     <script src="/static/script.js"></script>

@@ -7,6 +7,8 @@ document.addEventListener('DOMContentLoaded', function () {
     const addDocButton = document.getElementById('addDocButton');
     const docTitleInput = document.getElementById('docTitle');
     const docContentInput = document.getElementById('docContent');
+     
+
 
     // Search documents function
     function searchDocuments() {
@@ -46,7 +48,6 @@ document.addEventListener('DOMContentLoaded', function () {
         header.innerHTML = `
             <h2>Search Results</h2>
             <p>Query: "${data.query}" using ${data.metric} similarity</p>
-            <p>Found ${data.total_results} document(s)</p>
         `;
         resultsDiv.appendChild(header);
 
@@ -60,8 +61,8 @@ document.addEventListener('DOMContentLoaded', function () {
                 resultItem.classList.add('result-item');
 
                 let content = doc.content;
-                if (content.length > 200) {
-                    content = content.substring(0, 200) + '...';
+                if (content.length > 400) {
+                    content = content.substring(0, 400) + '...';
                 }
 
                 resultItem.innerHTML = `
