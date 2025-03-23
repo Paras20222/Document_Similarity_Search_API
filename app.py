@@ -165,20 +165,20 @@ async def rebuild_index():
     doc_ids = np.array([int(doc["id"]) for doc in valid_documents], dtype=np.int64)
     
     logger.info(f"Encoding {len(contents)} documents...")
-embeddings = np.array(model.encode(contents, show_progress_bar=True), dtype=np.float32)
+    embeddings = np.array(model.encode(contents, show_progress_bar=True), dtype=np.float32)
 
-if embeddings.shape[0] != doc_ids.shape[0]:
-    logger.error(f"Mismatch in embeddings ({embeddings.shape[0]}) and IDs ({doc_ids.shape[0]})")
-    return
+    if embeddings.shape[0] != doc_ids.shape[0]:
+        logger.error(f"Mismatch in embeddings ({embeddings.shape[0]}) and IDs ({doc_ids.shape[0]})")
+        return
 
-index.add_with_ids(embeddings, doc_ids)
-logger.info(f"FAISS index rebuilt with {len(doc_ids)} documents")
+    index.add_with_ids(embeddings, doc_ids)
+    logger.info(f"FAISS index rebuilt with {len(doc_ids)} documents")
 
-# Save index to file
-try:
-    faiss.write_index(index, FAISS_INDEX_FILE)
-except Exception as e:
-    logger.error(f"Failed to save FAISS index: {str(e)}")
+    # Save index to file
+    try:
+        faiss.write_index(index, FAISS_INDEX_FILE)
+    except Exception as e:
+        logger.error(f"Failed to save FAISS index: {str(e)}")
 
 def compute_similarity(query_embedding, doc_embeddings, metric):
     """Computes similarity scores."""
@@ -344,4 +344,3 @@ async def add_document(document: DocumentInput):
 
 if __name__ == "__main__":
     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
-
