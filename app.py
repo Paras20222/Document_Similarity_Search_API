@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Query, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from typing import List, Dict, Any, Optional
 import uvicorn
 import numpy as np
@@ -11,7 +11,18 @@ import json
 import logging
 import faiss
 from sentence_transformers import SentenceTransformer
-from fastapi.responses import JSONResponse
+from dotenv import load_dotenv
+import psycopg2
+
+# Load environment variables from .env
+load_dotenv()
+
+# Access environment variables
+DB_HOST = os.getenv("DB_HOST")
+DB_PORT = os.getenv("DB_PORT")
+DB_USER = os.getenv("DB_USER")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
+DB_NAME = os.getenv("DB_NAME")
 
 # Logging Setup
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -66,6 +77,7 @@ DOCS_FILE = os.path.join(DATA_DIR, "documents.json")
 EMBEDDINGS_FILE = os.path.join(DATA_DIR, "embeddings.npy")
 METRICS = {"cosine", "dot", "euclidean"}
 DEFAULT_METRIC = "cosine"
+FAISS_INDEX_FILE = os.path.join(DATA_DIR, "faiss_index.index")
 
 # Ensure data directory exists
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -76,25 +88,22 @@ embeddings = np.empty((0, VECTOR_DIM), dtype=np.float32)
 model = None
 index = None
 
-# Serve the index page
-@app.get("/", response_class=HTMLResponse)
-async def get_index():
+# Function to connect to database
+def connect_to_db():
     try:
-        with open("static/index.html") as f:
-            return f.read()
-    except FileNotFoundError:
-        logger.error("Index.html not found in static directory")
-        return {"error": "Index.html not found"}
+        conn = psycopg2.connect(
+            host=DB_HOST,
+            port=DB_PORT,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            dbname=DB_NAME
+        )
+        return conn
+    except psycopg2.Error as e:
+        logger.error(f"Failed to connect to database: {str(e)}")
+        return None
 
-# Exception handler for better error messages
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    logger.error(f"Unhandled exception: {str(exc)}")
-    return JSONResponse(
-        status_code=500,
-        content={"detail": "An unexpected error occurred. Please try again."}
-    )
-
+# Load model and data on startup
 @app.on_event("startup")
 async def load_model_and_data():
     global model, index, documents, embeddings
@@ -131,8 +140,15 @@ async def rebuild_index():
     """Rebuilds FAISS index from stored documents."""
     global index, documents, embeddings
 
-    index = faiss.IndexFlatL2(VECTOR_DIM)
-    index = faiss.IndexIDMap(index)
+    if faiss.get_num_gpus() > 0:
+        # Use GPU if available
+        index = faiss.IndexFlatL2(VECTOR_DIM)
+        index = faiss.IndexIDMap(index)
+        res = faiss.StandardGpuResources()
+        index = faiss.index_cpu_to_gpu(res, 0, index)
+    else:
+        index = faiss.IndexFlatL2(VECTOR_DIM)
+        index = faiss.IndexIDMap(index)
 
     if not documents:
         logger.info("No documents to index")
@@ -147,23 +163,27 @@ async def rebuild_index():
     doc_indices, valid_documents = zip(*valid_docs)
     contents = [doc["content"] for doc in valid_documents]
     doc_ids = np.array([int(doc["id"]) for doc in valid_documents], dtype=np.int64)
-
-    logger.info(f"Encoding {len(contents)} documents...")
-    embeddings = np.array(model.encode(contents, show_progress_bar=True), dtype=np.float32)
     
-    if embeddings.shape[0] != doc_ids.shape[0]:
-        logger.error(f"Mismatch in embeddings ({embeddings.shape[0]}) and IDs ({doc_ids.shape[0]})")
-        return
+    logger.info(f"Encoding {len(contents)} documents...")
+embeddings = np.array(model.encode(contents, show_progress_bar=True), dtype=np.float32)
 
-    index.add_with_ids(embeddings, doc_ids)
-    logger.info(f"FAISS index rebuilt with {len(doc_ids)} documents")
+if embeddings.shape[0] != doc_ids.shape[0]:
+    logger.error(f"Mismatch in embeddings ({embeddings.shape[0]}) and IDs ({doc_ids.shape[0]})")
+    return
 
-import numpy as np
+index.add_with_ids(embeddings, doc_ids)
+logger.info(f"FAISS index rebuilt with {len(doc_ids)} documents")
+
+# Save index to file
+try:
+    faiss.write_index(index, FAISS_INDEX_FILE)
+except Exception as e:
+    logger.error(f"Failed to save FAISS index: {str(e)}")
 
 def compute_similarity(query_embedding, doc_embeddings, metric):
     """Computes similarity scores."""
     if metric == "cosine":
-        # Avoid division by zero
+        # Add your cosine similarity logic here
         query_norm = np.linalg.norm(query_embedding)
         if query_norm == 0:
             query_embedding = np.ones_like(query_embedding) / np.sqrt(len(query_embedding))
@@ -203,9 +223,14 @@ def compute_similarity(query_embedding, doc_embeddings, metric):
     
     raise ValueError(f"Unsupported metric: {metric}")
 
-@app.get("/", tags=["Root"])
-async def home():
-    return {"message": "Welcome to the Document Similarity Search API", "status": "Running"}
+@app.get("/", response_class=HTMLResponse)
+async def get_index():
+    try:
+        with open("static/index.html") as f:
+            return f.read()
+    except FileNotFoundError:
+        logger.error("Index.html not found in static directory")
+        return {"error": "Index.html not found"}
 
 @app.get("/api/search", response_model=SearchResponse)
 async def search_documents(
@@ -262,7 +287,7 @@ async def search_documents(
 @app.post("/api/documents", status_code=201)
 async def add_document(document: DocumentInput):
     global documents, embeddings
-
+    
     # Validate document content
     if not document.content.strip():
         raise HTTPException(status_code=400, detail="Document content cannot be empty")
@@ -291,39 +316,32 @@ async def add_document(document: DocumentInput):
         logger.error(f"Failed to save data: {str(e)}")
         # Continue anyway as the document is already in memory
 
-    # Rebuild index with new document
-    await rebuild_index()
+    # Update index with new document
+    if faiss.get_num_gpus() > 0:
+        # Use GPU if available
+        new_index = faiss.IndexFlatL2(VECTOR_DIM)
+        new_index = faiss.IndexIDMap(new_index)
+        res = faiss.StandardGpuResources()
+        new_index = faiss.index_cpu_to_gpu(res, 0, new_index)
+    else:
+        new_index = faiss.IndexFlatL2(VECTOR_DIM)
+        new_index = faiss.IndexIDMap(new_index)
+
+    new_index.add_with_ids([new_embedding], [int(doc_id)])
+
+    # Merge new index with existing index
+    if index is not None:
+        if faiss.get_num_gpus() > 0:
+            index.merge_from(new_index)
+        else:
+            index.add_with_ids([new_embedding], [int(doc_id)])
+    else:
+        index = new_index
+
+    logger.info(f"Added document {doc_id} to index")
 
     return {"id": doc_id, "message": "Document added successfully"}
 
-@app.get("/api/documents", response_model=List[Document])
-async def get_documents(limit: int = Query(100, ge=1, le=1000)):
-    return [Document(**doc) for doc in documents[:limit]]
-
-@app.get("/api/documents/{doc_id}", response_model=Document)
-async def get_document(doc_id: str):
-    doc = next((d for d in documents if d["id"] == doc_id), None)
-    if not doc:
-        raise HTTPException(status_code=404, detail="Document not found")
-    return Document(**doc)
-
-@app.get("/health")
-async def health_check():
-    return {
-        "status": "healthy",
-        "documents_count": len(documents),
-        "embeddings_shape": embeddings.shape if hasattr(embeddings, "shape") else None,
-        "index_size": index.ntotal if index is not None else 0
-    }
-
-# Add a debugging endpoint to check frontend-backend communication
-@app.get("/api/debug/echo")
-async def echo_request(q: str = Query(None)):
-    return {
-        "received_query": q,
-        "documents_count": len(documents),
-        "embeddings_shape": embeddings.shape if hasattr(embeddings, "shape") else None
-    }
-
 if __name__ == "__main__":
     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+
