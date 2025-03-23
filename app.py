@@ -1,86 +1,13 @@
-from fastapi import FastAPI, Query, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from fastapi.responses import HTMLResponse, JSONResponse
-from typing import List, Dict, Any, Optional
-import uvicorn
-import numpy as np
-from fastapi.staticfiles import StaticFiles
 import os
 import json
-import logging
 import faiss
+import numpy as np
 from sentence_transformers import SentenceTransformer
-from dotenv import load_dotenv
-import psycopg2
-
-# Load environment variables from .env
-load_dotenv()
-
-# Access environment variables
-DB_HOST = os.getenv("DB_HOST")
-DB_PORT = os.getenv("DB_PORT")
-DB_USER = os.getenv("DB_USER")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
-DB_NAME = os.getenv("DB_NAME")
-
-# Logging Setup
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
-
-# FastAPI Initialization
-app = FastAPI(
-    title="Document Similarity Search API",
-    description="Find similar documents using FAISS and SentenceTransformers",
-    version="2.0.0"
-)
-
-# Mount static files (CSS, JS)
-app.mount("/static", StaticFiles(directory="static"), name="static")
-
-# CORS Middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Data Models
-class Document(BaseModel):
-    id: str
-    title: str
-    content: str
-    metadata: Optional[Dict[str, Any]] = None
-
-class DocumentInput(BaseModel):
-    title: str
-    content: str
-    metadata: Optional[Dict[str, Any]] = None
-
-class SearchResult(BaseModel):
-    document: Document
-    score: float
-
-class SearchResponse(BaseModel):
-    results: List[SearchResult]
-    query: str
-    metric: str
-    total_results: int
 
 # Constants
-MODEL_NAME = "all-MiniLM-L6-v2"
 VECTOR_DIM = 384
-DATA_DIR = "data"
-DOCS_FILE = os.path.join(DATA_DIR, "documents.json")
-EMBEDDINGS_FILE = os.path.join(DATA_DIR, "embeddings.npy")
-METRICS = {"cosine", "dot", "euclidean"}
-DEFAULT_METRIC = "cosine"
-FAISS_INDEX_FILE = os.path.join(DATA_DIR, "faiss_index.index")
-
-# Ensure data directory exists
-os.makedirs(DATA_DIR, exist_ok=True)
+MODEL_NAME = "all-MiniLM-L6-v2"
+DOCUMENTS_CHUNKS_DIR = "documents_chunks"  # Directory where chunked files are stored
 
 # Global Variables
 documents = []
@@ -88,58 +15,15 @@ embeddings = np.empty((0, VECTOR_DIM), dtype=np.float32)
 model = None
 index = None
 
-# Function to connect to database
-def connect_to_db():
-    try:
-        conn = psycopg2.connect(
-            host=DB_HOST,
-            port=DB_PORT,
-            user=DB_USER,
-            password=DB_PASSWORD,
-            dbname=DB_NAME
-        )
-        return conn
-    except psycopg2.Error as e:
-        logger.error(f"Failed to connect to database: {str(e)}")
-        return None
-
-# Load model and data on startup
-@app.on_event("startup")
-async def load_model_and_data():
-    global model, index, documents, embeddings
-
-    logger.info(f"Loading model: {MODEL_NAME}")
-    model = SentenceTransformer(MODEL_NAME)
-
-    try:
-        if os.path.exists(DOCS_FILE):
-            with open(DOCS_FILE, "r") as f:
-                documents = json.load(f)
-            logger.info(f"Loaded {len(documents)} documents")
-        else:
-            documents = []
-            logger.warning(f"Documents file not found at {DOCS_FILE}. Starting with empty collection.")
-    except json.JSONDecodeError:
-        logger.error("Error loading JSON file: Invalid JSON format")
-        documents = []
-
-    try:
-        if os.path.exists(EMBEDDINGS_FILE):
-            embeddings = np.load(EMBEDDINGS_FILE)
-            logger.info(f"Loaded embeddings with shape {embeddings.shape}")
-        else:
-            embeddings = np.empty((0, VECTOR_DIM), dtype=np.float32)
-            logger.warning(f"Embeddings file not found at {EMBEDDINGS_FILE}. Starting with empty embeddings.")
-    except Exception as e:
-        logger.error(f"Error loading embeddings: {str(e)}")
-        embeddings = np.empty((0, VECTOR_DIM), dtype=np.float32)
-
-    await rebuild_index()
-
 async def rebuild_index():
-    """Rebuilds FAISS index from stored documents."""
+    """Rebuilds FAISS index from chunked document files."""
     global index, documents, embeddings
 
+    # Initialize model if not already loaded
+    if model is None:
+        model = SentenceTransformer(MODEL_NAME)
+
+    # Create or clear the FAISS index
     if faiss.get_num_gpus() > 0:
         # Use GPU if available
         index = faiss.IndexFlatL2(VECTOR_DIM)
@@ -150,35 +34,52 @@ async def rebuild_index():
         index = faiss.IndexFlatL2(VECTOR_DIM)
         index = faiss.IndexIDMap(index)
 
-    if not documents:
-        logger.info("No documents to index")
-        return
+    # Load documents from chunked files in the "documents_chunks" directory
+    chunk_files = [f for f in os.listdir(DOCUMENTS_CHUNKS_DIR) if f.endswith(".json")]
+    chunk_files.sort()  # Optional: to process the chunks in a sorted order
 
-    valid_docs = [(i, doc) for i, doc in enumerate(documents) if doc["content"].strip()]
-    
-    if not valid_docs:
-        logger.warning("No valid documents found for indexing")
-        return
-    
-    doc_indices, valid_documents = zip(*valid_docs)
-    contents = [doc["content"] for doc in valid_documents]
-    doc_ids = np.array([int(doc["id"]) for doc in valid_documents], dtype=np.int64)
-    
-    logger.info(f"Encoding {len(contents)} documents...")
-    embeddings = np.array(model.encode(contents, show_progress_bar=True), dtype=np.float32)
+    # Load each chunk and add to the FAISS index
+    for chunk_file in chunk_files:
+        chunk_path = os.path.join(DOCUMENTS_CHUNKS_DIR, chunk_file)
+        logger.info(f"Loading chunk: {chunk_path}")
 
-    if embeddings.shape[0] != doc_ids.shape[0]:
-        logger.error(f"Mismatch in embeddings ({embeddings.shape[0]}) and IDs ({doc_ids.shape[0]})")
-        return
+        try:
+            with open(chunk_path, "r") as f:
+                chunk_documents = json.load(f)
 
-    index.add_with_ids(embeddings, doc_ids)
-    logger.info(f"FAISS index rebuilt with {len(doc_ids)} documents")
+                # Process in smaller batches to avoid memory issues
+                batch_size = 2500
+                for i in range(0, len(chunk_documents), batch_size):
+                    batch = chunk_documents[i:i + batch_size]
 
-    # Save index to file
+                    # Extract content and prepare embeddings
+                    contents = [doc["content"] for doc in batch]
+                    embeddings_batch = np.array(model.encode(contents, show_progress_bar=True), dtype=np.float32)
+
+                    # Prepare document IDs (based on the index of documents in the batch)
+                    doc_ids = np.array([int(doc["id"]) for doc in batch], dtype=np.int64)
+
+                    # Add embeddings to the FAISS index
+                    if embeddings_batch.shape[0] != doc_ids.shape[0]:
+                        logger.error(f"Mismatch in number of embeddings ({embeddings_batch.shape[0]}) and document IDs ({doc_ids.shape[0]})")
+                        continue
+
+                    index.add_with_ids(embeddings_batch, doc_ids)
+                    logger.info(f"Added {len(batch)} documents from {chunk_file} to index")
+
+        except Exception as e:
+            logger.error(f"Error loading chunk {chunk_file}: {str(e)}")
+
+    logger.info(f"FAISS index rebuilt with {index.ntotal} documents")
+
+    # Save the rebuilt index to file
     try:
-        faiss.write_index(index, FAISS_INDEX_FILE)
+        faiss.write_index(index, "faiss_index.index")
     except Exception as e:
         logger.error(f"Failed to save FAISS index: {str(e)}")
+
+
+
 
 def compute_similarity(query_embedding, doc_embeddings, metric):
     """Computes similarity scores."""
