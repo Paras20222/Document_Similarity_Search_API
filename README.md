@@ -49,7 +49,12 @@ The repository includes a script to load sample BBC news articles:
 ```
 python load_data.py
 ```
+## Sample Videos
 
+You can also view these two sample videos related to the project:
+
+- [Similarity Search](Video_1.mp4)
+- [Real Time Indexing](Video_2.mp4)
 
 ### Implementing More Advanced Features
 
