@@ -165,25 +165,25 @@ async def rebuild_index():
     doc_ids = np.array([int(doc["id"]) for doc in valid_documents], dtype=np.int64)
     
     logger.info(f"Encoding {len(contents)} documents...")
-    embeddings = np.array(model.encode(contents, show_progress_bar=True), dtype=np.float32)
-    
-    if embeddings.shape[0] != doc_ids.shape[0]:
-        logger.error(f"Mismatch in embeddings ({embeddings.shape[0]}) and IDs ({doc_ids.shape[0]})")
-        return
+embeddings = np.array(model.encode(contents, show_progress_bar=True), dtype=np.float32)
 
-    index.add_with_ids(embeddings, doc_ids)
-    logger.info(f"FAISS index rebuilt with {len(doc_ids)} documents")
+if embeddings.shape[0] != doc_ids.shape[0]:
+    logger.error(f"Mismatch in embeddings ({embeddings.shape[0]}) and IDs ({doc_ids.shape[0]})")
+    return
 
-    # Save index to file
-    try:
-        faiss.write_index(index, FAISS_INDEX_FILE)
-    except Exception as e:
-        logger.error(f"Failed to save FAISS index: {str(e)}")
+index.add_with_ids(embeddings, doc_ids)
+logger.info(f"FAISS index rebuilt with {len(doc_ids)} documents")
+
+# Save index to file
+try:
+    faiss.write_index(index, FAISS_INDEX_FILE)
+except Exception as e:
+    logger.error(f"Failed to save FAISS index: {str(e)}")
 
 def compute_similarity(query_embedding, doc_embeddings, metric):
     """Computes similarity scores."""
     if metric == "cosine":
-        # Avoid division by zero
+        # Add your cosine similarity logic here
         query_norm = np.linalg.norm(query_embedding)
         if query_norm == 0:
             query_embedding = np.ones_like(query_embedding) / np.sqrt(len(query_embedding))
