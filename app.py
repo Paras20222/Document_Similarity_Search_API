@@ -11,18 +11,7 @@ import json
 import logging
 import faiss
 from sentence_transformers import SentenceTransformer
-from dotenv import load_dotenv
-import psycopg2
-
-# Load environment variables from .env
-load_dotenv()
-
-# Access environment variables
-DB_HOST = os.getenv("DB_HOST")
-DB_PORT = os.getenv("DB_PORT")
-DB_USER = os.getenv("DB_USER")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
-DB_NAME = os.getenv("DB_NAME")
+import time
 
 # Logging Setup
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -36,7 +25,10 @@ app = FastAPI(
 )
 
 # Mount static files (CSS, JS)
-app.mount("/static", StaticFiles(directory="static"), name="static")
+try:
+    app.mount("/static", StaticFiles(directory="static"), name="static")
+except Exception as e:
+    logger.warning(f"Could not mount static files: {str(e)}")
 
 # CORS Middleware
 app.add_middleware(
@@ -68,16 +60,17 @@ class SearchResponse(BaseModel):
     query: str
     metric: str
     total_results: int
+    time_ms: float
 
 # Constants
 MODEL_NAME = "all-MiniLM-L6-v2"
 VECTOR_DIM = 384
 DATA_DIR = "data"
 DOCS_FILE = os.path.join(DATA_DIR, "documents.json")
-EMBEDDINGS_FILE = os.path.join(DATA_DIR, "embeddings.npy")
+EMBEDDINGS_FILE = os.path.join(DATA_DIR, "embeddings_.npy")
+INDEX_FILE = os.path.join(DATA_DIR, "faiss_index_.index")
 METRICS = {"cosine", "dot", "euclidean"}
 DEFAULT_METRIC = "cosine"
-FAISS_INDEX_FILE = os.path.join(DATA_DIR, "faiss_index.index")
 
 # Ensure data directory exists
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -88,140 +81,208 @@ embeddings = np.empty((0, VECTOR_DIM), dtype=np.float32)
 model = None
 index = None
 
-# Load model and data on startup
+# Serve the index page
+@app.get("/", response_class=HTMLResponse)
+async def get_index():
+    try:
+        with open("static/index.html") as f:
+            return f.read()
+    except FileNotFoundError:
+        logger.error("Index.html not found in static directory")
+        return HTMLResponse(content="<html><body><h1>Welcome to Document Similarity Search API</h1><p>HTML interface not found. Please use the API endpoints directly.</p></body></html>")
+
+# Exception handler for better error messages
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.error(f"Unhandled exception: {str(exc)}")
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "An unexpected error occurred. Please try again."}
+    )
+
+def save_faiss_index(index_to_save, filepath):
+    """Save FAISS index to file"""
+    try:
+        faiss.write_index(index_to_save, filepath)
+        logger.info(f"FAISS index saved to {filepath}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to save FAISS index: {str(e)}")
+        return False
+
+def load_faiss_index(filepath):
+    """Load FAISS index from file"""
+    try:
+        if os.path.exists(filepath):
+            loaded_index = faiss.read_index(filepath)
+            logger.info(f"FAISS index loaded from {filepath}")
+            return loaded_index
+        else:
+            logger.warning(f"No FAISS index found at {filepath}")
+            return None
+    except Exception as e:
+        logger.error(f"Failed to load FAISS index: {str(e)}")
+        return None
+
+def compute_similarity(query_embedding, doc_embeddings, metric="cosine", normalize=True):
+    if normalize:
+        query_embedding = query_embedding / np.linalg.norm(query_embedding)
+        doc_embeddings /= np.linalg.norm(doc_embeddings, axis=1, keepdims=True)
+    
+    if metric == "cosine":
+        scores = np.dot(doc_embeddings, query_embedding)
+        scores = (scores + 1) / 2
+    
+    elif metric == "dot":
+        scores = np.dot(doc_embeddings, query_embedding)
+        scores = (scores + 1) / 2
+    
+    elif metric == "euclidean":
+        distances = np.linalg.norm(doc_embeddings - query_embedding, axis=1)
+        scores = 1 / (1 + distances)
+    
+    else:
+        raise ValueError(f"Unsupported metric: {metric}")
+
+    return scores
+
 @app.on_event("startup")
 async def load_model_and_data():
     global model, index, documents, embeddings
 
     logger.info(f"Loading model: {MODEL_NAME}")
-    model = SentenceTransformer(MODEL_NAME)
+    try:
+        model = SentenceTransformer(MODEL_NAME)
+    except Exception as e:
+        logger.error(f"Failed to load model: {str(e)}")
+        model = None
+        # We'll continue anyway and handle the error in the endpoints
 
+    # Load documents
     try:
         if os.path.exists(DOCS_FILE):
             with open(DOCS_FILE, "r") as f:
                 documents = json.load(f)
-            logger.info(f"Loaded {len(documents)} documents")
+            logger.info(f"Loaded {len(documents)} documents from {DOCS_FILE}")
         else:
             documents = []
             logger.warning(f"Documents file not found at {DOCS_FILE}. Starting with empty collection.")
     except json.JSONDecodeError:
         logger.error("Error loading JSON file: Invalid JSON format")
         documents = []
+    except Exception as e:
+        logger.error(f"Unexpected error loading documents: {str(e)}")
+        documents = []
 
+    # Load embeddings
     try:
         if os.path.exists(EMBEDDINGS_FILE):
             embeddings = np.load(EMBEDDINGS_FILE)
-            logger.info(f"Loaded embeddings with shape {embeddings.shape}")
+            logger.info(f"Loaded embeddings with shape {embeddings.shape} from {EMBEDDINGS_FILE}")
         else:
-            logger.error(f"Embeddings file not found at {EMBEDDINGS_FILE}.")
-            return
+            embeddings = np.empty((0, VECTOR_DIM), dtype=np.float32)
+            logger.warning(f"Embeddings file not found at {EMBEDDINGS_FILE}. Starting with empty embeddings.")
     except Exception as e:
         logger.error(f"Error loading embeddings: {str(e)}")
-        return
+        embeddings = np.empty((0, VECTOR_DIM), dtype=np.float32)
 
-    # Load precomputed FAISS index if available
-    if os.path.exists(FAISS_INDEX_FILE):
-        try:
-            index = faiss.read_index(FAISS_INDEX_FILE)
-            logger.info(f"Loaded existing FAISS index with {index.ntotal} documents")
-        except Exception as e:
-            logger.error(f"Failed to load FAISS index: {str(e)}")
-    else:
-        logger.warning(f"FAISS index file not found at {FAISS_INDEX_FILE}. Rebuilding index...")
+    # Try to load existing FAISS index
+    index = load_faiss_index(INDEX_FILE)
+    
+    # If index couldn't be loaded or document counts don't match, rebuild it
+    if model is not None and (index is None or (index.ntotal != len(documents))):
+        logger.info("Index needs to be rebuilt")
         await rebuild_index()
+    else:
+        logger.info(f"FAISS index ready with {index.ntotal if index else 0} vectors")
 
 async def rebuild_index():
-    """Rebuilds FAISS index from stored documents and embeddings."""
+    """Rebuilds FAISS index from stored documents."""
     global index, documents, embeddings
 
-    # Create or clear the FAISS index
-    if faiss.get_num_gpus() > 0:
-        # Use GPU if available
-        index = faiss.IndexFlatL2(VECTOR_DIM)
-        index = faiss.IndexIDMap(index)
-        res = faiss.StandardGpuResources()
-        index = faiss.index_cpu_to_gpu(res, 0, index)
-    else:
-        index = faiss.IndexFlatL2(VECTOR_DIM)
-        index = faiss.IndexIDMap(index)
-
-    # Prepare document IDs (based on the index of documents in the list)
-    doc_ids = np.array([int(doc["id"]) for doc in documents], dtype=np.int64)
-
-    # Add embeddings to the FAISS index
-    if embeddings.shape[0] != doc_ids.shape[0]:
-        logger.error(f"Mismatch in number of embeddings ({embeddings.shape[0]}) and document IDs ({doc_ids.shape[0]})")
+    if model is None:
+        logger.error("Cannot rebuild index: Model not loaded")
         return
-
-    index.add_with_ids(embeddings, doc_ids)
-    logger.info(f"FAISS index rebuilt with {len(doc_ids)} documents")
-
-    # Save the rebuilt index to file
+        
     try:
-        faiss.write_index(index, FAISS_INDEX_FILE)
+        # Initialize a new index
+        logger.info("Creating new FAISS index")
+        index = faiss.IndexFlatL2(VECTOR_DIM)
+        index = faiss.IndexIDMap(index)
+
+        if not documents:
+            logger.info("No documents to index")
+            return
+
+        valid_docs = [(i, doc) for i, doc in enumerate(documents) if doc.get("content", "").strip()]
+        
+        if not valid_docs:
+            logger.warning("No valid documents found for indexing")
+            return
+        
+        doc_indices, valid_documents = zip(*valid_docs)
+        contents = [doc["content"] for doc in valid_documents]
+        
+        # Create document IDs
+        try:
+            doc_ids = np.array([int(doc["id"]) for doc in valid_documents], dtype=np.int64)
+        except (ValueError, KeyError) as e:
+            logger.error(f"Error processing document IDs: {str(e)}")
+            # Generate sequential IDs instead
+            doc_ids = np.array(range(len(valid_documents)), dtype=np.int64)
+            # Update documents with new IDs
+            for i, doc_idx in enumerate(doc_indices):
+                documents[doc_idx]["id"] = str(i)
+
+        logger.info(f"Encoding {len(contents)} documents...")
+        start_time = time.time()
+        embeddings = np.array(model.encode(contents, show_progress_bar=True), dtype=np.float32)
+        logger.info(f"Encoding completed in {time.time() - start_time:.2f} seconds")
+        
+        if embeddings.shape[0] != doc_ids.shape[0]:
+            logger.error(f"Mismatch in embeddings ({embeddings.shape[0]}) and IDs ({doc_ids.shape[0]})")
+            return
+
+        # Add vectors to the index
+        index.add_with_ids(embeddings, doc_ids)
+        logger.info(f"FAISS index rebuilt with {len(doc_ids)} documents")
+        
+        # Save updated data
+        try:
+            np.save(EMBEDDINGS_FILE, embeddings)
+            with open(DOCS_FILE, "w") as f:
+                json.dump(documents, f, indent=2)
+            logger.info(f"Saved {len(documents)} documents and {embeddings.shape[0]} embeddings")
+        except Exception as e:
+            logger.error(f"Error saving data: {str(e)}")
+        
+        # Save the index to file
+        save_faiss_index(index, INDEX_FILE)
     except Exception as e:
-        logger.error(f"Failed to save FAISS index: {str(e)}")
+        logger.error(f"Error rebuilding index: {str(e)}")
 
-def compute_similarity(query_embedding, doc_embeddings, metric):
-    """Computes similarity scores."""
-    if metric == "cosine":
-        # Avoid division by zero
-        query_norm = np.linalg.norm(query_embedding)
-        if query_norm == 0:
-            query_embedding = np.ones_like(query_embedding) / np.sqrt(len(query_embedding))
-        else:
-            query_embedding /= query_norm
-            
-        # Normalize document embeddings
-        norms = np.linalg.norm(doc_embeddings, axis=1, keepdims=True)
-        norms[norms == 0] = 1  # Avoid division by zero
-        doc_embeddings /= norms
-        
-        return np.dot(doc_embeddings, query_embedding)
-    
-    elif metric == "dot":
-        # Normalize vectors for comparable scores
-        query_norm = np.linalg.norm(query_embedding)
-        if query_norm == 0:
-            query_embedding = np.ones_like(query_embedding) / np.sqrt(len(query_embedding))
-        else:
-            query_embedding /= query_norm
-            
-        norms = np.linalg.norm(doc_embeddings, axis=1, keepdims=True)
-        norms[norms == 0] = 1  # Avoid division by zero
-        doc_embeddings /= norms
-        
-        return np.dot(doc_embeddings, query_embedding)
-    
-    elif metric == "euclidean":
-        # Calculate Euclidean distance and convert to similarity score
-        distances = np.linalg.norm(doc_embeddings - query_embedding, axis=1)
-        # Invert distance to get similarity score (higher is more similar)
-        max_distance = np.max(distances)
-        if max_distance == 0:
-            return np.ones_like(distances)
-        else:
-            return 1 - (distances / max_distance)
-    
-    raise ValueError(f"Unsupported metric: {metric}")
-
-@app.get("/", response_class=HTMLResponse)
-async def get_index():
-    try:
-        with open("static/index.html") as f:
-            return f.read()
-    except FileNotFoundError:
-        logger.error("Index.html not found in static directory")
-        return {"error": "Index.html not found"}
+@app.get("/api", tags=["Root"])
+async def home():
+    return {
+        "message": "Welcome to the Document Similarity Search API", 
+        "status": "Running",
+        "docs": "/docs",
+        "health": "/health"
+    }
 
 @app.get("/api/search", response_model=SearchResponse)
 async def search_documents(
     q: str = Query(..., description="Search query"),
     metric: str = Query(DEFAULT_METRIC, description=f"Similarity metric: {', '.join(METRICS)}"),
     limit: int = Query(5, ge=1, le=20),
-    page: int = Query(1, ge=1)
+    page: int = Query(1, ge=1),
+    normalize: bool = Query(True, description="Normalize similarity scores to [0,1] range")
 ):
+    start_time = time.time()
     logger.info(f"Search request: q='{q}', metric={metric}, limit={limit}, page={page}")
+    
+    if model is None:
+        raise HTTPException(status_code=503, detail="Model not loaded. Service unavailable.")
     
     if not q.strip():
         raise HTTPException(status_code=400, detail="Query cannot be empty")
@@ -231,11 +292,20 @@ async def search_documents(
 
     if not documents or index is None or index.ntotal == 0:
         logger.warning("Search requested but no documents are indexed")
-        return SearchResponse(results=[], query=q, metric=metric, total_results=0)
+        return SearchResponse(
+            results=[], 
+            query=q, 
+            metric=metric, 
+            total_results=0,
+            time_ms=0
+        )
 
     try:
+        # Encode query
         query_embedding = model.encode([q])[0]
-        scores = compute_similarity(query_embedding, embeddings, metric)
+        
+        # Compute similarity scores
+        scores = compute_similarity(query_embedding, embeddings, metric, normalize=normalize)
         
         # Get ranked indices by score
         ranked_indices = np.argsort(scores)[::-1]
@@ -250,17 +320,32 @@ async def search_documents(
         # Get paginated results
         paginated_indices = ranked_indices[start:end]
         
-        results = [
-            SearchResult(document=Document(**documents[idx]), score=float(scores[idx]))
-            for idx in paginated_indices
-        ]
+        results = []
         
-        logger.info(f"Search for '{q}' returned {total_matches} total matches")
+        for idx in paginated_indices:
+            if idx < len(documents) and idx < len(scores):
+                doc = documents[idx]
+                # Ensure document has required fields
+                if not all(k in doc for k in ["id", "title", "content"]):
+                    logger.warning(f"Document at index {idx} missing required fields")
+                    continue
+                    
+                results.append(
+                    SearchResult(
+                        document=Document(**doc),
+                        score=float(scores[idx])
+                    )
+                )
+        
+        elapsed_time = (time.time() - start_time) * 1000  # Convert to milliseconds
+        logger.info(f"Search for '{q}' returned {total_matches} total matches in {elapsed_time:.2f}ms")
+        
         return SearchResponse(
             results=results, 
             query=q, 
             metric=metric, 
-            total_results=total_matches
+            total_results=total_matches,
+            time_ms=elapsed_time
         )
     except Exception as e:
         logger.error(f"Error during search: {str(e)}")
@@ -268,8 +353,11 @@ async def search_documents(
 
 @app.post("/api/documents", status_code=201)
 async def add_document(document: DocumentInput):
-    global documents, embeddings
+    global documents, embeddings, index  # Ensure index is in scope
     
+    if model is None:
+        raise HTTPException(status_code=503, detail="Model not loaded. Service unavailable.")
+
     # Validate document content
     if not document.content.strip():
         raise HTTPException(status_code=400, detail="Document content cannot be empty")
@@ -282,7 +370,12 @@ async def add_document(document: DocumentInput):
     # Generate embedding
     try:
         new_embedding = model.encode([document.content])[0].astype(np.float32)
-        embeddings = np.vstack([embeddings, new_embedding]) if embeddings.size > 0 else np.array([new_embedding])
+        
+        # Add to embeddings array
+        if embeddings.size > 0:
+            embeddings = np.vstack([embeddings, new_embedding])
+        else:
+            embeddings = np.array([new_embedding])
     except Exception as e:
         # Roll back document addition if embedding fails
         documents.pop()
@@ -298,157 +391,93 @@ async def add_document(document: DocumentInput):
         logger.error(f"Failed to save data: {str(e)}")
         # Continue anyway as the document is already in memory
 
-    # Update index with new document
-    if faiss.get_num_gpus() > 0:
-        # Use GPU if available
-        new_index = faiss.IndexFlatL2(VECTOR_DIM)
-        new_index = faiss.IndexIDMap(new_index)
-        res = faiss.StandardGpuResources()
-        new_index = faiss.index_cpu_to_gpu(res, 0, new_index)
-    else:
-        new_index = faiss.IndexFlatL2(VECTOR_DIM)
-        new_index = faiss.IndexIDMap(new_index)
-
-    new_index.add_with_ids(np.array([new_embedding]), np.array([int(doc_id)]))
-
-
-    # Merge new index with existing index
+    # Add to index directly if it exists
     if index is not None:
-        if faiss.get_num_gpus() > 0:
-            index.merge_from(new_index)
-        else:
-            index.add_with_ids([new_embedding], [int(doc_id)])
+        try:
+            # Reshape to ensure 2D array for FAISS
+            new_embedding_reshaped = new_embedding.reshape(1, -1)
+            index.add_with_ids(new_embedding_reshaped, np.array([int(doc_id)], dtype=np.int64))
+            save_faiss_index(index, INDEX_FILE)
+        except Exception as e:
+            logger.error(f"Failed to update index: {str(e)}")
+            # Rebuild the whole index as fallback
+            await rebuild_index()
     else:
-        index = new_index
-
-    logger.info(f"Added document {doc_id} to index")
+        # Rebuild index if it doesn't exist
+        await rebuild_index()
 
     return {"id": doc_id, "message": "Document added successfully"}
 
-if __name__ == "__main__":
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
-
+@app.delete("/api/documents/{doc_id}", status_code=200)
+async def delete_document(doc_id: str):
+    global documents, embeddings, index
     
-    raise ValueError(f"Unsupported metric: {metric}")
-
-@app.get("/", response_class=HTMLResponse)
-async def get_index():
-    try:
-        with open("static/index.html") as f:
-            return f.read()
-    except FileNotFoundError:
-        logger.error("Index.html not found in static directory")
-        return {"error": "Index.html not found"}
-
-@app.get("/api/search", response_model=SearchResponse)
-async def search_documents(
-    q: str = Query(..., description="Search query"),
-    metric: str = Query(DEFAULT_METRIC, description=f"Similarity metric: {', '.join(METRICS)}"),
-    limit: int = Query(5, ge=1, le=20),
-    page: int = Query(1, ge=1)
-):
-    logger.info(f"Search request: q='{q}', metric={metric}, limit={limit}, page={page}")
+    # Find document index
+    doc_idx = next((i for i, doc in enumerate(documents) if doc["id"] == doc_id), None)
     
-    if not q.strip():
-        raise HTTPException(status_code=400, detail="Query cannot be empty")
-        
-    if metric not in METRICS:
-        raise HTTPException(status_code=400, detail=f"Invalid metric. Must be one of: {', '.join(METRICS)}")
-
-    if not documents or index is None or index.ntotal == 0:
-        logger.warning("Search requested but no documents are indexed")
-        return SearchResponse(results=[], query=q, metric=metric, total_results=0)
-
-    try:
-        query_embedding = model.encode([q])[0]
-        scores = compute_similarity(query_embedding, embeddings, metric)
-        
-        # Get ranked indices by score
-        ranked_indices = np.argsort(scores)[::-1]
-        
-        # Calculate pagination
-        start = (page - 1) * limit
-        end = start + limit
-        
-        # Get total results (all matches)
-        total_matches = len(ranked_indices)
-        
-        # Get paginated results
-        paginated_indices = ranked_indices[start:end]
-        
-        results = [
-            SearchResult(document=Document(**documents[idx]), score=float(scores[idx]))
-            for idx in paginated_indices
-        ]
-        
-        logger.info(f"Search for '{q}' returned {total_matches} total matches")
-        return SearchResponse(
-            results=results, 
-            query=q, 
-            metric=metric, 
-            total_results=total_matches
-        )
-    except Exception as e:
-        logger.error(f"Error during search: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
-
-@app.post("/api/documents", status_code=201)
-async def add_document(document: DocumentInput):
-    global documents, embeddings
+    if doc_idx is None:
+        raise HTTPException(status_code=404, detail="Document not found")
     
-    # Validate document content
-    if not document.content.strip():
-        raise HTTPException(status_code=400, detail="Document content cannot be empty")
-
-    # Generate new document ID
-    doc_id = str(max((int(doc["id"]) for doc in documents), default=0) + 1)
-    new_doc = {"id": doc_id, **document.dict()}
-    documents.append(new_doc)
-
-    # Generate embedding
-    try:
-        new_embedding = model.encode([document.content])[0].astype(np.float32)
-        embeddings = np.vstack([embeddings, new_embedding]) if embeddings.size > 0 else np.array([new_embedding])
-    except Exception as e:
-        # Roll back document addition if embedding fails
-        documents.pop()
-        logger.error(f"Failed to generate embedding: {str(e)}")
-        raise HTTPException(status_code=500, detail="Failed to process document")
-
+    # Remove from documents list
+    documents.pop(doc_idx)
+    
+    # Remove from embeddings array
+    if doc_idx < len(embeddings):
+        embeddings = np.delete(embeddings, doc_idx, axis=0)
+    
     # Save updated data
     try:
         np.save(EMBEDDINGS_FILE, embeddings)
         with open(DOCS_FILE, "w") as f:
             json.dump(documents, f, indent=2)
     except Exception as e:
-        logger.error(f"Failed to save data: {str(e)}")
-        # Continue anyway as the document is already in memory
+        logger.error(f"Failed to save data after deletion: {str(e)}")
+    
+    # Rebuild index (FAISS doesn't support efficient removal)
+    await rebuild_index()
+    
+    return {"message": f"Document {doc_id} deleted successfully"}
 
-    # Update index with new document
-    if faiss.get_num_gpus() > 0:
-        # Use GPU if available
-        new_index = faiss.IndexFlatL2(VECTOR_DIM)
-        new_index = faiss.IndexIDMap(new_index)
-        res = faiss.StandardGpuResources()
-        new_index = faiss.index_cpu_to_gpu(res, 0, new_index)
-    else:
-        new_index = faiss.IndexFlatL2(VECTOR_DIM)
-        new_index = faiss.IndexIDMap(new_index)
+@app.get("/api/documents", response_model=List[Document])
+async def get_documents(limit: int = Query(100, ge=1, le=1000), offset: int = Query(0, ge=0)):
+    if not documents:
+        return []
+        
+    end = min(offset + limit, len(documents))
+    if offset >= len(documents):
+        return []
+        
+    return [Document(**doc) for doc in documents[offset:end]]
 
-    new_index.add_with_ids([new_embedding], [int(doc_id)])
+@app.get("/api/documents/{doc_id}", response_model=Document)
+async def get_document(doc_id: str):
+    doc = next((d for d in documents if d["id"] == doc_id), None)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    return Document(**doc)
 
-    # Merge new index with existing index
-    if index is not None:
-        if faiss.get_num_gpus() > 0:
-            index.merge_from(new_index)
-        else:
-            index.add_with_ids([new_embedding], [int(doc_id)])
-    else:
-        index = new_index
+@app.get("/health")
+async def health_check():
+    model_status = "loaded" if model is not None else "not_loaded"
+    index_status = "loaded" if index is not None else "not_loaded"
+    
+    return {
+        "status": "healthy" if model is not None else "degraded",
+        "documents_count": len(documents),
+        "embeddings_shape": embeddings.shape if hasattr(embeddings, "shape") else None,
+        "index_size": index.ntotal if index is not None else 0,
+        "model_status": model_status,
+        "index_status": index_status,
+        "metrics_available": list(METRICS)
+    }
 
-    logger.info(f"Added document {doc_id} to index")
-
-    return {"id": doc_id, "message": "Document added successfully"}
+@app.get("/api/metrics")
+async def get_metrics():
+    """Return available similarity metrics"""
+    return {
+        "available_metrics": list(METRICS),
+        "default_metric": DEFAULT_METRIC
+    }
 
 if __name__ == "__main__":
     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
