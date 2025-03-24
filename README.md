@@ -23,7 +23,7 @@ A machine learning powered API that finds similar documents using embeddings and
 1. Clone the repository:
    ```
    git clone https://github.com/Paras20222/Document_Similarity_Search_API
-   cd document-similarity-search
+   cd Document_Similarity_Search_API
    ```
 
 2. Create a virtual environment:
@@ -39,7 +39,11 @@ A machine learning powered API that finds similar documents using embeddings and
 
 4. Run the application:
    ```
-   uvicorn app:app --reload
+   uvicorn app:app --host 0.0.0.0 --port 8000 --reload
+   ```
+5. Access the API
+   ```
+   Open http://127.0.0.1:8000 in your browser
    ```
 
 ## Loading Sample Data
