@@ -309,7 +309,8 @@ async def add_document(document: DocumentInput):
         new_index = faiss.IndexFlatL2(VECTOR_DIM)
         new_index = faiss.IndexIDMap(new_index)
 
-    new_index.add_with_ids([new_embedding], [int(doc_id)])
+    new_index.add_with_ids(np.array([new_embedding]), np.array([int(doc_id)]))
+
 
     # Merge new index with existing index
     if index is not None:
