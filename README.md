@@ -39,7 +39,7 @@ A machine learning powered API that finds similar documents using embeddings and
 
 4. Run the application:
    ```
-   uvicorn app:app --host 0.0.0.0 --port 8000 --reload
+   uvicorn main:app --reload --log-level debug
    ```
 5. Access the API
    ```
